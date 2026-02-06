@@ -324,7 +324,7 @@ class AugmentationConfig:
 class SimCLRConfig:
     """SimCLR pre-training configuration - DGX optimized."""
     # Model architecture
-    backbone: str = "resnet50"  # ✅ Changed to resnet34  # Options: resnet18, resnet34, resnet50
+    backbone: str = "resnet50"  # ✅ Changed to resnet34  # Options: resnet18, resnet34, resnet50, resnet101
     projection_dim: int = 128
     hidden_dim: int = 512
     
@@ -458,6 +458,23 @@ class ExperimentConfig:
         }
 
 
+def register_torch_safe_globals() -> None:
+    try:
+        from torch.serialization import add_safe_globals
+    except Exception:
+        return
+    safe_types = [
+        PathConfig,
+        DataConfig,
+        AugmentationConfig,
+        SimCLRConfig,
+        FineTuneConfig,
+        EvaluationConfig,
+        ExperimentConfig
+    ]
+    add_safe_globals(safe_types)
+
+
 # ============================================================================
 # IMPROVED LOGGING SETUP
 # ============================================================================
@@ -525,6 +542,13 @@ def setup_logging(log_dir: Path, experiment_name: str, debug: bool = False) -> l
     logger.addHandler(file_handler)
     
     return logger
+
+
+class SafeCSVLogger(CSVLogger):
+    def log_metrics(self, metrics: Dict[str, Any], step: int) -> None:
+        if metrics:
+            metrics = {str(k): v for k, v in metrics.items() if k is not None}
+        super().log_metrics(metrics, step)
 
 
 # ============================================================================
@@ -2365,12 +2389,26 @@ def resnet3d_50(in_channels: int = 1, num_classes: int = 2, **kwargs) -> ResNet3
     )
 
 
+def resnet3d_101(in_channels: int = 1, num_classes: int = 2, **kwargs) -> ResNet3D:
+    """
+    ResNet-101 3D.
+    
+    Total params: ~85M (with 1 input channel)
+    """
+    return ResNet3D(
+        BottleneckBlock3D, [3, 4, 23, 3],
+        in_channels=in_channels,
+        num_classes=num_classes,
+        **kwargs
+    )
+
+
 def get_backbone(name: str, in_channels: int = 1) -> ResNet3D:
     """
     Get backbone by name.
     
     Args:
-        name: Backbone name (resnet18, resnet34, resnet50)
+        name: Backbone name (resnet18, resnet34, resnet50, resnet101)
         in_channels: Number of input channels
     
     Returns:
@@ -2380,6 +2418,7 @@ def get_backbone(name: str, in_channels: int = 1) -> ResNet3D:
         'resnet18': resnet3d_18,
         'resnet34': resnet3d_34,
         'resnet50': resnet3d_50,
+        'resnet101': resnet3d_101,
     }
     
     name = name.lower()
@@ -2683,6 +2722,8 @@ class SimCLRModule(LightningModule):
             backbone = resnet3d_34(in_channels=1)
         elif backbone_name == 'resnet50':
             backbone = resnet3d_50(in_channels=1)
+        elif backbone_name == 'resnet101':
+            backbone = resnet3d_101(in_channels=1)
         else:
             raise ValueError(f"Unknown backbone: {backbone_name}")
         
@@ -3124,6 +3165,10 @@ class MCIClassifier(LightningModule):
                 self.log('val_ppv', ppv, sync_dist=True)
                 self.log('val_npv', npv, sync_dist=True)
                 self.log('val_balanced_accuracy', (sensitivity + specificity) / 2, prog_bar=True, sync_dist=True)
+            
+            self._log_tensorboard_visuals('val', labels_np, probs_np, preds_threshold)
+        else:
+            self._log_tensorboard_confusion('val', labels_np, preds_np)
         
         self.val_outputs.clear()
     
@@ -3192,6 +3237,11 @@ class MCIClassifier(LightningModule):
             'metrics': metrics
         }
         
+        if self.num_classes == 2:
+            self._log_tensorboard_visuals('test', all_labels, all_probs, all_preds)
+        else:
+            self._log_tensorboard_confusion('test', all_labels, all_preds)
+        
         self.test_outputs.clear()
         
         return metrics
@@ -3231,6 +3281,69 @@ class MCIClassifier(LightningModule):
                 metrics['balanced_accuracy'] = (metrics['sensitivity'] + metrics['specificity']) / 2
         
         return metrics
+    
+    def _get_tensorboard_writers(self) -> List[Any]:
+        writers: List[Any] = []
+        if hasattr(self, "loggers") and self.loggers:
+            for logger in self.loggers:
+                if isinstance(logger, TensorBoardLogger):
+                    writers.append(logger.experiment)
+        elif isinstance(getattr(self, "logger", None), TensorBoardLogger):
+            writers.append(self.logger.experiment)
+        return writers
+    
+    def _log_tensorboard_confusion(self, stage: str, labels: np.ndarray, preds: np.ndarray) -> None:
+        writers = self._get_tensorboard_writers()
+        if not writers:
+            return
+        cm = confusion_matrix(labels, preds)
+        fig, ax = plt.subplots(figsize=(4, 4))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, ax=ax)
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('True')
+        ax.set_title(f'{stage} confusion matrix')
+        if self.class_names and len(self.class_names) == cm.shape[0]:
+            ax.set_xticklabels(self.class_names)
+            ax.set_yticklabels(self.class_names)
+        step = self.global_step if self.global_step is not None else self.current_epoch
+        for writer in writers:
+            writer.add_figure(f'{stage}/confusion_matrix', fig, global_step=step)
+        plt.close(fig)
+    
+    def _log_tensorboard_visuals(self, stage: str, labels: np.ndarray, probs: np.ndarray, preds: np.ndarray) -> None:
+        writers = self._get_tensorboard_writers()
+        if not writers:
+            return
+        cm = confusion_matrix(labels, preds)
+        fig_cm, ax_cm = plt.subplots(figsize=(4, 4))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, ax=ax_cm)
+        ax_cm.set_xlabel('Predicted')
+        ax_cm.set_ylabel('True')
+        ax_cm.set_title(f'{stage} confusion matrix')
+        if self.class_names and len(self.class_names) == 2:
+            ax_cm.set_xticklabels(self.class_names)
+            ax_cm.set_yticklabels(self.class_names)
+        fpr, tpr, _ = roc_curve(labels, probs[:, 1])
+        fig_roc, ax_roc = plt.subplots(figsize=(4, 4))
+        ax_roc.plot(fpr, tpr, color='blue')
+        ax_roc.plot([0, 1], [0, 1], color='gray', linestyle='--')
+        ax_roc.set_xlabel('False Positive Rate')
+        ax_roc.set_ylabel('True Positive Rate')
+        ax_roc.set_title(f'{stage} ROC')
+        precision, recall, _ = precision_recall_curve(labels, probs[:, 1])
+        fig_pr, ax_pr = plt.subplots(figsize=(4, 4))
+        ax_pr.plot(recall, precision, color='green')
+        ax_pr.set_xlabel('Recall')
+        ax_pr.set_ylabel('Precision')
+        ax_pr.set_title(f'{stage} Precision-Recall')
+        step = self.global_step if self.global_step is not None else self.current_epoch
+        for writer in writers:
+            writer.add_figure(f'{stage}/confusion_matrix', fig_cm, global_step=step)
+            writer.add_figure(f'{stage}/roc', fig_roc, global_step=step)
+            writer.add_figure(f'{stage}/precision_recall', fig_pr, global_step=step)
+        plt.close(fig_cm)
+        plt.close(fig_roc)
+        plt.close(fig_pr)
     
     def configure_optimizers(self):
         """Configure optimizer and scheduler."""
@@ -3310,6 +3423,27 @@ class UnfreezeBackboneCallback(Callback):
         self.unfreeze_epoch = unfreeze_epoch
         self.unfrozen = False
 
+    def _reset_grad_scaler(self, scaler, device='cuda'):
+        """Safely reset GradScaler with correct dtypes"""
+        if scaler is None:
+            return False
+        
+        try:
+            # _scale must be float32
+            scaler._scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+            
+            # _growth_tracker must be int32 (THIS WAS THE BUG!)
+            scaler._growth_tracker = torch.tensor(0, dtype=torch.int32, device=device)
+            
+            # Optional: reset growth interval to default
+            if hasattr(scaler, '_growth_interval'):
+                scaler._growth_interval = scaler._init_growth_interval if hasattr(scaler, '_init_growth_interval') else 2000
+            
+            return True
+        except Exception as e:
+            print(f"   ⚠️  GradScaler reset failed: {e}")
+            return False
+
     def on_train_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
         if self.unfrozen:
             return
@@ -3322,9 +3456,6 @@ class UnfreezeBackboneCallback(Callback):
         self.unfrozen = True
 
         # --- Step 2: build new optimizer with VERY conservative LRs ---
-        # After 10 epochs of head-only training the head has converged to a
-        # certain feature expectation.  Hitting the backbone with a large LR
-        # destroys those features instantly.  Use lr*0.01 for backbone.
         config = pl_module.config  # FineTuneConfig
         backbone_lr = config.lr * 0.01   # e.g. 1e-4 * 0.01 = 1e-6
         head_lr     = config.lr * 0.1    # e.g. 1e-4 * 0.1  = 1e-5
@@ -3337,22 +3468,32 @@ class UnfreezeBackboneCallback(Callback):
         )
 
         # --- Step 3: RESET the AMP GradScaler (critical for 16-mixed) ---
-        # Lightning stores the scaler at trainer.scaler (PL 1.x / 2.x) or
-        # inside the strategy.  We handle both paths.
+        # Get device from model
+        device = next(pl_module.parameters()).device
+        
+        scaler_reset = False
         try:
+            # Method 1: Direct trainer.scaler (older Lightning versions)
             if hasattr(trainer, 'scaler') and trainer.scaler is not None:
-                trainer.scaler._scale = torch.tensor(1.0, dtype=torch.float32, device='cuda')
-                trainer.scaler._growth_tracker = torch.tensor(0.0, dtype=torch.float32, device='cuda')
-                print(f"   🔄 GradScaler reset (scale=1.0)")
+                scaler_reset = self._reset_grad_scaler(trainer.scaler, device)
+                if scaler_reset:
+                    print(f"   🔄 GradScaler reset (scale=1.0)")
+            
+            # Method 2: Via strategy (Lightning 2.x)
             elif hasattr(trainer, 'strategy') and hasattr(trainer.strategy, 'scaler'):
-                scaler = trainer.strategy.scaler
-                if scaler is not None:
-                    scaler._scale = torch.tensor(1.0, dtype=torch.float32, device='cuda')
-                    scaler._growth_tracker = torch.tensor(0.0, dtype=torch.float32, device='cuda')
+                scaler_reset = self._reset_grad_scaler(trainer.strategy.scaler, device)
+                if scaler_reset:
                     print(f"   🔄 GradScaler reset via strategy (scale=1.0)")
+            
+            # Method 3: Via precision plugin (Lightning 2.x alternate)
+            elif hasattr(trainer, 'precision_plugin') and hasattr(trainer.precision_plugin, 'scaler'):
+                scaler_reset = self._reset_grad_scaler(trainer.precision_plugin.scaler, device)
+                if scaler_reset:
+                    print(f"   🔄 GradScaler reset via precision_plugin (scale=1.0)")
+                    
         except Exception as e:
             print(f"   ⚠️  Could not reset GradScaler: {e}")
-            print(f"        (training will still work if precision != 16-mixed)")
+            print(f"        (training will continue, but watch for loss spikes)")
 
         # --- Step 4: fresh scheduler covering the remaining epochs ---
         remaining_epochs = trainer.max_epochs - trainer.current_epoch
@@ -3380,8 +3521,7 @@ class UnfreezeBackboneCallback(Callback):
         print(f"\n🔓 Epoch {trainer.current_epoch}: backbone UNFROZEN + optimizer re-configured")
         print(f"   backbone lr = {backbone_lr:.2e},  head lr = {head_lr:.2e}")
         pl_module.log('backbone_unfrozen', 1.0)
-
-
+        
 class GPUMemoryMonitorCallback(Callback):
     """
     Callback to monitor and log GPU memory usage.
@@ -4025,7 +4165,7 @@ class ExperimentRunner:
                 name='simclr_pretrain',
                 version=self.config.experiment_name
             ),
-            CSVLogger(
+            SafeCSVLogger(
                 save_dir=str(self.config.paths.logs_dir),
                 name='simclr_csv',
                 version=self.config.experiment_name
@@ -4139,6 +4279,7 @@ class ExperimentRunner:
                  splits: Optional[Dict[str, List[ScanInfo]]] = None,
                  pretrain_checkpoint: Optional[str] = None,
                  labeled_fraction: float = 1.0,
+                 resume_checkpoint: Optional[str] = None,
                  fold_idx: Optional[int] = None) -> Dict[str, float]:
         """
         Step 3: Fine-tune for MCI classification.
@@ -4320,7 +4461,7 @@ class ExperimentRunner:
                 name='finetune',
                 version=version_name
             ),
-            CSVLogger(
+            SafeCSVLogger(
                 save_dir=str(self.config.paths.logs_dir),
                 name='finetune_csv',
                 version=version_name
@@ -4458,8 +4599,13 @@ class ExperimentRunner:
         self.logger.info("🎯 DataLoader validated successfully, starting training...")
         self.logger.info("")
         
+        ckpt_path = None
+        if resume_checkpoint and Path(resume_checkpoint).exists():
+            ckpt_path = resume_checkpoint
+            self.logger.info(f"📂 Resuming fine-tuning from checkpoint: {ckpt_path}")
+        
         try:
-            trainer.fit(model, datamodule)
+            trainer.fit(model, datamodule, ckpt_path=ckpt_path)
         except KeyboardInterrupt:
             self.logger.warning("⚠️ Training interrupted by user")
         
@@ -4769,7 +4915,7 @@ class ExperimentRunner:
                 name='evaluate',
                 version=version_name
             ),
-            CSVLogger(
+            SafeCSVLogger(
                 save_dir=str(self.config.paths.logs_dir),
                 name='evaluate_csv',
                 version=version_name
@@ -5074,7 +5220,7 @@ Version: 5.0.0 (Production - ResNet50 - Backbone Loading + Unfreeze + SyncBN fix
     parser.add_argument(
         '--backbone',
         type=str,
-        choices=['resnet18', 'resnet34', 'resnet50'],
+        choices=['resnet18', 'resnet34', 'resnet50', 'resnet101'],
         default=None,
         help='Override backbone architecture'
     )
@@ -5147,6 +5293,7 @@ def main():
     
     # Create configuration
     config = ExperimentConfig(seed=args.seed)
+    register_torch_safe_globals()
     
     # Override experiment name
     if args.experiment_name:
@@ -5208,7 +5355,8 @@ def main():
                 runner.finetune(
                     splits=splits,
                     pretrain_checkpoint=args.pretrain_checkpoint,
-                    labeled_fraction=args.labeled_fraction
+                    labeled_fraction=args.labeled_fraction,
+                    resume_checkpoint=args.resume_checkpoint
                 )
             else:
                 print("🔍 Dry run - would execute fine-tuning")
