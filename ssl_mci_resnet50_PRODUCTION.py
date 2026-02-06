@@ -324,12 +324,12 @@ class AugmentationConfig:
 class SimCLRConfig:
     """SimCLR pre-training configuration - DGX optimized."""
     # Model architecture
-    backbone: str = "resnet50"  # ✅ Changed to resnet34  # Options: resnet18, resnet34, resnet50, resnet101
+    backbone: str = "resnet50"  # Options: resnet18, resnet34, resnet50, resnet101
     projection_dim: int = 128
     hidden_dim: int = 512
     
     # Training - optimized for multi-GPU (32GB per GPU)
-    batch_size_per_gpu: int = 48
+    batch_size_per_gpu: int = 16
     epochs: int = 500
     base_lr: float = 0.3
     weight_decay: float = 1e-4
@@ -3872,6 +3872,7 @@ class ADNIDataModule(LightningDataModule):
         
         # ✅ PRODUCTION FIX: Use config-based persistent_workers setting (not auto-calculated)
         # This prevents deadlocks with large 3D medical data
+        drop_last = self.mode == 'pretrain'
         return DataLoader(
             self.train_dataset,
             batch_size=batch_size,
@@ -3879,7 +3880,7 @@ class ADNIDataModule(LightningDataModule):
             sampler=sampler,
             num_workers=num_workers,
             pin_memory=self.config.data.pin_memory,
-            drop_last=True,
+            drop_last=drop_last,
             persistent_workers=self.config.data.persistent_workers,  # ✅ Use config value
             prefetch_factor=self.config.data.prefetch_factor if num_workers > 0 else None
         )
@@ -4113,10 +4114,14 @@ class ExperimentRunner:
         )
         
         # Create model
+        use_gradient_checkpointing = (
+            self.config.simclr.batch_size_per_gpu >= 16
+            or self.config.simclr.backbone.lower() == "resnet101"
+        )
         model = SimCLRModule(
             config=self.config.simclr,
             num_gpus=self.num_gpus,
-            use_gradient_checkpointing=self.config.simclr.batch_size_per_gpu >= 16
+            use_gradient_checkpointing=use_gradient_checkpointing
         )
         
         # Log model info
@@ -4187,8 +4192,8 @@ class ExperimentRunner:
             'log_every_n_steps': 10,
             'enable_progress_bar': True,
             'enable_model_summary': True,
-            'deterministic': False,  # For speed
-            'benchmark': True,  # For speed with fixed input size
+            'deterministic': True,
+            'benchmark': False,
         }
         
         # Multi-GPU strategy
@@ -4487,8 +4492,8 @@ class ExperimentRunner:
             enable_progress_bar=True,
             enable_model_summary=True,
             num_sanity_val_steps=0,
-            deterministic=False,
-            benchmark=True,
+            deterministic=True,
+            benchmark=False,
             gradient_clip_val=self.config.finetune.gradient_clip_val
         )
         
@@ -5137,7 +5142,7 @@ Examples:
       --experiment-name my_experiment
 
 Author: Improved Research Pipeline
-Version: 5.0.0 (Production - ResNet50 - Backbone Loading + Unfreeze + SyncBN fixes)
+Version: 6.0.0 (Production - ResNet50 - ALL CRITICAL FIXES APPLIED + DataLoader Stability)
         """
     )
     
